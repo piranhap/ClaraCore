@@ -54,7 +54,14 @@ fi
 
 echo ""
 echo -e "${BLUE}Starting ClaraCore using Docker...${NC}"
-docker compose -f "$COMPOSE_FILE" up -d --build
+SUFFIX=$(basename "$(dirname "$COMPOSE_FILE")" | cut -d- -f2)
+IMAGE_NAME="claracore:$SUFFIX"
+echo -e "🔨 Building Docker image: $IMAGE_NAME..."
+DOCKER_FILE_PATH="$(dirname "$COMPOSE_FILE")/Dockerfile.$SUFFIX"
+docker build -t "$IMAGE_NAME" -f "$DOCKER_FILE_PATH" .
+
+echo -e "🚀 Starting Docker container..."
+docker compose -f "$COMPOSE_FILE" up -d
 
 # Wait for container to be healthy
 echo ""
