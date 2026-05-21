@@ -16,7 +16,7 @@ services:
       
       # Optional: Bind mount your own model folders
       # Uncomment and customize the paths below to use your existing models
-      # - /path/to/your/models:/app/models:ro          # Read-only access
+      - /mnt/models/ggufs:/app/models:ro          # Read-only access
       # - /mnt/storage/llm-models:/app/external:ro     # Another folder
       # - ~/ai-models:/app/my-models:ro                # Home directory models
       
