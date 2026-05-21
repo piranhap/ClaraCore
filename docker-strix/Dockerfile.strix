@@ -1,5 +1,5 @@
-# Use AMD Strix Halo Vulkan toolbox image for latest APU support
-FROM kyuz0/amd-strix-halo-toolboxes:vulkan-radv
+# Use forked AMD Strix Halo Vulkan toolbox image for latest APU support
+FROM ghcr.io/piranhap/amd-strix-halo-toolboxes:vulkan-radv
 
 # Set working directory
 WORKDIR /app

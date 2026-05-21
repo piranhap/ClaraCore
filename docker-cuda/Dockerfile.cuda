@@ -1,5 +1,5 @@
-# Use llama.cpp's official CUDA server image - has CUDA support built-in
-FROM ghcr.io/ggml-org/llama.cpp:server-cuda
+# Use forked llama.cpp server image
+FROM ghcr.io/piranhap/llama.cpp:server-cuda
 
 # Set working directory
 WORKDIR /app

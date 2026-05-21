@@ -1,5 +1,5 @@
-# Use llama.cpp's official CPU-only server image
-FROM ghcr.io/ggml-org/llama.cpp:server
+# Use forked llama.cpp server image
+FROM ghcr.io/piranhap/llama.cpp:server
 
 # Set working directory
 WORKDIR /app

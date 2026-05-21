@@ -1,5 +1,5 @@
-# Use official ROCm llama.cpp image for AMD GPU support
-FROM rocm/llama.cpp:llama.cpp-b6356_rocm6.4.3_ubuntu24.04_light
+# Use forked ROCm llama.cpp image for AMD GPU support
+FROM ghcr.io/piranhap/llama.cpp:rocm
 
 # Set working directory
 WORKDIR /app
