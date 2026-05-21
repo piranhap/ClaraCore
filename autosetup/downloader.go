@@ -2,6 +2,8 @@ package autosetup
 
 import (
 	"archive/zip"
+	"archive/tar" // Added for .tar.gz extraction
+	"compress/gzip" // Added for .tar.gz extraction
 	"bufio"
 	"context"
 	"encoding/json"
@@ -308,13 +310,13 @@ func GetOptimalBinaryURL(system SystemInfo, forceBackend string, version string)
 		switch binaryType {
 		case "cuda":
 			// CUDA not available as pre-built - use Vulkan for NVIDIA GPUs
-			filename = fmt.Sprintf("llama-%s-bin-ubuntu-vulkan-x64.zip", version)
+			filename = fmt.Sprintf("llama-%s-bin-ubuntu-vulkan-x64.tar.gz", version)
 		case "vulkan":
-			filename = fmt.Sprintf("llama-%s-bin-ubuntu-vulkan-x64.zip", version)
+			filename = fmt.Sprintf("llama-%s-bin-ubuntu-vulkan-x64.tar.gz", version)
 		case "rocm":
-			filename = fmt.Sprintf("llama-%s-bin-ubuntu-rocm-x64.zip", version)
+			filename = fmt.Sprintf("llama-%s-bin-ubuntu-rocm-x64.tar.gz", version)
 		case "cpu":
-			filename = fmt.Sprintf("llama-%s-bin-ubuntu-x64.zip", version)
+			filename = fmt.Sprintf("llama-%s-bin-ubuntu-x64.tar.gz", version)
 		default:
 			return "", "", fmt.Errorf("unsupported backend '%s' for Linux", binaryType)
 		}
@@ -514,19 +516,28 @@ func DownloadBinary(downloadDir string, system SystemInfo, forceBackend string) 
 		// Single download for non-CUDA or non-Windows
 		fmt.Printf("Downloading llama-server (%s) from: %s\n", binaryType, url)
 
-		// Download the file
-		zipPath := filepath.Join(downloadDir, "llama-server.zip")
-		err = downloadFile(url, zipPath)
+		// Determine filename and extension
+		downloadFilename := filepath.Base(url)
+		archivePath := filepath.Join(downloadDir, downloadFilename)
+
+		err = downloadFile(url, archivePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download binary: %v", err)
 		}
 
-		// Extract the zip file
-		err = extractZip(zipPath, extractDir)
+		// Extract the archive
+		if strings.HasSuffix(downloadFilename, ".zip") {
+			err = extractZip(archivePath, extractDir)
+		} else if strings.HasSuffix(downloadFilename, ".tar.gz") {
+			err = extractTarGz(archivePath, extractDir)
+		} else {
+			return nil, fmt.Errorf("unsupported archive format: %s", downloadFilename)
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract binary: %v", err)
 		}
-		os.Remove(zipPath)
+		os.Remove(archivePath)
 	}
 
 	// Find the llama-server executable
@@ -635,19 +646,28 @@ func ForceDownloadBinary(downloadDir string, system SystemInfo, forceBackend str
 		// Single download for non-CUDA or non-Windows
 		fmt.Printf("Downloading llama-server (%s) from: %s\n", binaryType, url)
 
-		// Download the file
-		zipPath := filepath.Join(downloadDir, "llama-server.zip")
-		err = downloadFile(url, zipPath)
+		// Determine filename and extension
+		downloadFilename := filepath.Base(url)
+		archivePath := filepath.Join(downloadDir, downloadFilename)
+
+		err = downloadFile(url, archivePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download binary: %v", err)
 		}
 
-		// Extract the zip file
-		err = extractZip(zipPath, extractDir)
+		// Extract the archive
+		if strings.HasSuffix(downloadFilename, ".zip") {
+			err = extractZip(archivePath, extractDir)
+		} else if strings.HasSuffix(downloadFilename, ".tar.gz") {
+			err = extractTarGz(archivePath, extractDir)
+		} else {
+			return nil, fmt.Errorf("unsupported archive format: %s", downloadFilename)
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract binary: %v", err)
 		}
-		os.Remove(zipPath)
+		os.Remove(archivePath)
 	}
 
 	// Find the llama-server executable
@@ -742,6 +762,55 @@ func extractZip(src, dest string) error {
 		}
 	}
 
+	return nil
+}
+
+// extractTarGz extracts a .tar.gz file to destination directory
+func extractTarGz(src, dest string) error {
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	gzr, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break // End of archive
+		}
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(dest, header.Name)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+
+			if _, err := io.Copy(f, tr); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
