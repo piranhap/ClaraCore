@@ -268,6 +268,15 @@ func (scg *ConfigGenerator) writeModel(config *strings.Builder, model ModelInfo,
 		config.WriteString(fmt.Sprintf("      --ctx-size %d\n", optimalContext))
 		config.WriteString(fmt.Sprintf("      -ngl %d\n", nglValue))
 
+		// Add tensor-split for multi-GPU
+		if scg.SystemInfo != nil && len(scg.SystemInfo.VRAMDetails) > 1 {
+			gpuIndices := []string{}
+			for i := range scg.SystemInfo.VRAMDetails {
+				gpuIndices = append(gpuIndices, fmt.Sprintf("%d", i))
+			}
+			config.WriteString(fmt.Sprintf("      --tensor-split %s\n", strings.Join(gpuIndices, ",")))
+		}
+
 		// Set KV cache type
 		config.WriteString(fmt.Sprintf("      --cache-type-k %s\n", kvCacheType))
 		config.WriteString(fmt.Sprintf("      --cache-type-v %s\n", kvCacheType))
@@ -282,11 +291,10 @@ func (scg *ConfigGenerator) writeModel(config *strings.Builder, model ModelInfo,
 	// Add TTL (Time To Live) - default 300 seconds
 	config.WriteString("    ttl: 300\n")
 
-	// Add environment
-	config.WriteString("    env:\n")
-	config.WriteString("      - \"CUDA_VISIBLE_DEVICES=0\"\n")
-	config.WriteString("\n")
-}
+	    // Add environment if needed (placeholder for future use)
+	    // config.WriteString("    env:\n")
+	    // config.WriteString("      - \"EXAMPLE_ENV=value\"\n")
+	    config.WriteString("\n")}
 
 // calculateOptimalNGL calculates the optimal number of GPU layers based on model size vs VRAM and system RAM
 func (scg *ConfigGenerator) calculateOptimalNGL(model ModelInfo) int {
