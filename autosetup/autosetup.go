@@ -36,6 +36,11 @@ type SetupOptions struct {
 	ForceBackend      string  // Force specific backend (cuda, rocm, cpu, vulkan) - overrides auto-detection
 	ForceRAM          float64 // Force total RAM in GB - overrides auto-detection
 	ForceVRAM         float64 // Force total VRAM in GB - overrides auto-detection
+
+	// GPUPins maps a case-insensitive model-filename substring to a GPU device ID,
+	// forcing those models onto a specific GPU and overriding auto-balance.
+	// e.g. {"hermes": 1, "qwen2.5-coder": 0}. Multi-GPU setups only.
+	GPUPins map[string]int
 }
 
 // AutoSetup performs automatic model detection and configuration with default options

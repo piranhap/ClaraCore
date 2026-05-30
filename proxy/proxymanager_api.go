@@ -43,6 +43,10 @@ type SystemSettings struct {
 	EnableJinja      bool    `json:"enableJinja"`
 	RequireAPIKey    bool    `json:"requireApiKey"`
 	APIKey           string  `json:"apiKey,omitempty"`
+
+	// GPUPins maps a case-insensitive model-filename substring to a GPU device ID,
+	// forcing those models onto a specific GPU during config generation.
+	GPUPins map[string]int `json:"gpuPins,omitempty"`
 }
 
 func (pm *ProxyManager) getSystemSettingsPath() string {
@@ -73,6 +77,42 @@ func (pm *ProxyManager) saveSystemSettings(s *SystemSettings) error {
 	return os.WriteFile(pm.getSystemSettingsPath(), data, 0644)
 }
 
+// apiGetGPUPins returns the current manual GPU pin map (filename substring -> device ID).
+func (pm *ProxyManager) apiGetGPUPins(c *gin.Context) {
+	pins := map[string]int{}
+	if s, err := pm.loadSystemSettings(); err == nil && s != nil && s.GPUPins != nil {
+		pins = s.GPUPins
+	}
+	c.JSON(http.StatusOK, gin.H{"gpuPins": pins})
+}
+
+// apiSetGPUPins replaces the manual GPU pin map. Pins take effect on the next
+// config regeneration (POST /api/config/regenerate-from-db).
+func (pm *ProxyManager) apiSetGPUPins(c *gin.Context) {
+	var req struct {
+		GPUPins map[string]int `json:"gpuPins"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid request: %v", err)})
+		return
+	}
+
+	s, err := pm.loadSystemSettings()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to load settings: %v", err)})
+		return
+	}
+	if s == nil {
+		s = &SystemSettings{}
+	}
+	s.GPUPins = req.GPUPins
+	if err := pm.saveSystemSettings(s); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save settings: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"gpuPins": s.GPUPins, "note": "Pins apply on next config regeneration"})
+}
+
 func addApiHandlers(pm *ProxyManager) {
 	// Add API endpoints for React to consume
 	apiGroup := pm.ginEngine.Group("/api", pm.requireAPIKey())
@@ -97,6 +137,10 @@ func addApiHandlers(pm *ProxyManager) {
 		// System settings persistence
 		apiGroup.GET("/settings/system", pm.apiGetSystemSettings)
 		apiGroup.POST("/settings/system", pm.apiSetSystemSettings)
+
+		// Manual GPU pinning (model-filename substring -> device ID)
+		apiGroup.GET("/config/gpu-pins", pm.apiGetGPUPins)
+		apiGroup.POST("/config/gpu-pins", pm.apiSetGPUPins)
 
 		// Configuration management endpoints
 		apiGroup.GET("/config", pm.apiGetConfig)
@@ -3001,6 +3045,10 @@ func (pm *ProxyManager) apiRegenerateConfigFromDatabase(c *gin.Context) {
 		}
 		if !req.Options.ThroughputFirst && savedSettings.ThroughputFirst {
 			req.Options.ThroughputFirst = true
+		}
+		// Apply saved GPU pins unless the request supplied its own.
+		if len(req.Options.GPUPins) == 0 && len(savedSettings.GPUPins) > 0 {
+			req.Options.GPUPins = savedSettings.GPUPins
 		}
 	}
 

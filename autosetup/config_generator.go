@@ -3,6 +3,7 @@ package autosetup
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -347,6 +348,16 @@ func (scg *ConfigGenerator) assignModelsToGPUs(models []ModelInfo) map[string]gp
 	smallestDevice := gpus[0].deviceID
 	smallestVRAM := gpus[0].vramGB
 
+	// vramForDevice returns a device's VRAM from the detected GPU list.
+	vramForDevice := func(dev int) float64 {
+		for _, g := range gpus {
+			if g.deviceID == dev {
+				return g.vramGB
+			}
+		}
+		return smallestVRAM
+	}
+
 	// Chat models, sorted by size descending for deterministic, big-first placement.
 	type sizedModel struct {
 		model  ModelInfo
@@ -366,6 +377,19 @@ func (scg *ConfigGenerator) assignModelsToGPUs(models []ModelInfo) map[string]gp
 	sort.Slice(chatModels, func(i, j int) bool { return chatModels[i].sizeGB > chatModels[j].sizeGB })
 
 	for _, sm := range chatModels {
+		// Honor an explicit manual pin before auto-balancing. Count the pin toward
+		// the balancer so unpinned models prefer the other (emptier) GPU.
+		if dev, ok := scg.matchGPUPin(sm.model); ok {
+			assignments[sm.model.Path] = gpuAssignment{DeviceID: dev, GPUVRAMGB: vramForDevice(dev)}
+			for i := range gpus {
+				if gpus[i].deviceID == dev {
+					gpus[i].count++
+					break
+				}
+			}
+			fmt.Printf("📌 %s (%.1f GB) → GPU %d (pinned)\n", sm.model.Name, sm.sizeGB, dev)
+			continue
+		}
 		// Pick the candidate GPU (model fits within vram-reserve) with the fewest
 		// models assigned so far; gpus is sorted smallest-first so ties favor the
 		// smaller card, keeping the larger card free for bigger models.
@@ -390,16 +414,36 @@ func (scg *ConfigGenerator) assignModelsToGPUs(models []ModelInfo) map[string]gp
 		fmt.Printf("🎮 %s (%.1f GB) → GPU %d (%.1f GB)\n", sm.model.Name, sm.sizeGB, gpus[bestIdx].deviceID, gpus[bestIdx].vramGB)
 	}
 
-	// Pin embedding models to the smallest GPU (they coexist via a persistent group).
+	// Embedding models default to the smallest GPU (they coexist via a persistent
+	// group), unless explicitly pinned elsewhere.
 	for _, m := range models {
 		if m.IsDraft || !scg.isEmbeddingModel(m) {
 			continue
 		}
-		assignments[m.Path] = gpuAssignment{DeviceID: smallestDevice, GPUVRAMGB: smallestVRAM}
-		fmt.Printf("🎮 %s (embedding) → GPU %d (%.1f GB)\n", m.Name, smallestDevice, smallestVRAM)
+		dev, vram := smallestDevice, smallestVRAM
+		if pinned, ok := scg.matchGPUPin(m); ok {
+			dev, vram = pinned, vramForDevice(pinned)
+		}
+		assignments[m.Path] = gpuAssignment{DeviceID: dev, GPUVRAMGB: vram}
+		fmt.Printf("🎮 %s (embedding) → GPU %d (%.1f GB)\n", m.Name, dev, vram)
 	}
 
 	return assignments
+}
+
+// matchGPUPin returns the pinned device for a model if any GPUPins key appears
+// (case-insensitive) in the model's filename. Returns ok=false when unpinned.
+func (scg *ConfigGenerator) matchGPUPin(model ModelInfo) (int, bool) {
+	if len(scg.Options.GPUPins) == 0 {
+		return 0, false
+	}
+	name := strings.ToLower(filepath.Base(model.Path))
+	for key, dev := range scg.Options.GPUPins {
+		if key != "" && strings.Contains(name, strings.ToLower(key)) {
+			return dev, true
+		}
+	}
+	return 0, false
 }
 
 // calculateOptimalNGL calculates the optimal number of GPU layers based on model size vs VRAM and system RAM
