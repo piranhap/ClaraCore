@@ -1,30 +1,54 @@
-# Stage 1: Build llama-server with ROCm support from the forked repository
-FROM ubuntu:22.04 as builder
+# Stage 1: Build llama-server with ROCm/HIP support from the forked repository.
+#
+# We build on top of AMD's ROCm "complete" dev image so the HIP compiler,
+# rocBLAS and hipBLAS (plus their Tensile data files) are present at build
+# AND runtime — copying individual ROCm .so files into a bare ubuntu image is
+# fragile, so both stages share this base.
+ARG ROCM_IMG=rocm/dev-ubuntu-24.04:6.4.4-complete
+FROM ${ROCM_IMG} AS builder
 
-# Install build dependencies
-# Note: Installing the full ROCm toolkit can be complex. 
-# This assumes a base set of packages. You may need to adjust.
-RUN apt-get update && apt-get install -y git build-essential cmake
+# Build dependencies (the ROCm toolchain itself is already in the base image)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates build-essential cmake libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Clone the forked llama.cpp repository
 RUN git clone https://github.com/piranhap/llama.cpp.git
 
-# Build llama-server using cmake with ROCm enabled
-WORKDIR /llama.cpp
-RUN cmake -B build -DGGML_HIPBLAS=ON
-RUN cmake --build build --config Release
+# GPU architectures to compile for. Broad by default to cover the cards listed
+# in README.md (RX 6000/7000, Radeon VII, MI series) plus Strix Halo (gfx1151).
+# Narrow this to just your GPU's arch to cut build time dramatically, e.g.
+#   --build-arg AMDGPU_TARGETS=gfx1100
+ARG AMDGPU_TARGETS=gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1031;gfx1100;gfx1101;gfx1102;gfx1151
 
-# Stage 2: Create the final ClaraCore image
-FROM ubuntu:22.04
+# Build llama-server with HIP enabled. NOTE: the correct flag is GGML_HIP
+# (GGML_HIPBLAS was removed upstream and silently builds CPU-only).
+WORKDIR /llama.cpp
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+    cmake -B build \
+      -DGGML_HIP=ON \
+      -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+      -DCMAKE_BUILD_TYPE=Release
+RUN cmake --build build --config Release -j"$(nproc)"
+
+# Stage 2: Create the final ClaraCore image (same ROCm base for runtime libs)
+FROM ${ROCM_IMG}
 
 # Set working directory
 WORKDIR /app
 
-# Copy llama-server from the builder stage
+# Copy llama-server and all its shared libraries from the builder stage.
+# The fork builds llama-server thin-linked against libggml*/libllama*/libmtmd .so,
+# so the binary alone fails with "libllama-server-impl.so: cannot open shared object file".
 COPY --from=builder /llama.cpp/build/bin/llama-server /app/llama-server
+COPY --from=builder /llama.cpp/build/bin/*.so* /app/
 
 # Copy the ClaraCore binary from the build context
 COPY claracore /app/claracore
+
+# Resolve the bundled shared libraries at runtime (ROCm libs live on the
+# base image's default ldconfig paths, so /app only needs to be prepended).
+ENV LD_LIBRARY_PATH=/app
 
 # Make binaries executable
 RUN chmod +x /app/claracore /app/llama-server
