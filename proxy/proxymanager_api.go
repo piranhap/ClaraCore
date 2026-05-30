@@ -538,6 +538,17 @@ func (pm *ProxyManager) apiGetSystemDetection(c *gin.Context) {
 		}
 	}
 
+	// Build allGPUs list from full VRAMDetails slice
+	allGPUs := []gin.H{}
+	for _, gpu := range system.VRAMDetails {
+		allGPUs = append(allGPUs, gin.H{
+			"name":     gpu.Name,
+			"brand":    gpuBrand,
+			"vramGB":   math.Round(gpu.VRAMGB*10) / 10,
+			"index":    gpu.DeviceID,
+		})
+	}
+
 	// Build recommendations
 	recommendations := gin.H{
 		"primaryBackend":          primaryBackend,
@@ -573,6 +584,8 @@ func (pm *ProxyManager) apiGetSystemDetection(c *gin.Context) {
 		"gpuDetected":               len(system.VRAMDetails) > 0,
 		"gpuTypes":                  gpuTypes,
 		"primaryGPU":                primaryGPU,
+		"allGPUs":                   allGPUs,
+		"gpuCount":                  len(system.VRAMDetails),
 		"totalRAMGB":                math.Round(totalRAMGB*10) / 10,     // Round to 1 decimal place
 		"availableRAMGB":            math.Round(availableRAMGB*10) / 10, // Round to 1 decimal place
 		"recommendedBackends":       backends,

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -20,6 +21,17 @@ type ConfigGenerator struct {
 	SystemInfo    *SystemInfo    // Add system info for optimal parameters
 	usedModelIDs  map[string]int // Track used model IDs and their counts
 	mmprojMatches []MMProjMatch  // Store mmproj matches for automatic --mmproj parameter addition
+
+	// gpuAssignments maps a model path to its GPU placement (multi-GPU only).
+	// Empty when single-GPU/CPU, in which case legacy single-GPU behavior is used.
+	gpuAssignments map[string]gpuAssignment
+}
+
+// gpuAssignment describes how a model is placed across GPUs.
+type gpuAssignment struct {
+	DeviceID  int     // CUDA device ID this model is pinned to (ignored if Oversized)
+	GPUVRAMGB float64 // VRAM of the assigned GPU, used for NGL sizing
+	Oversized bool    // true => model spans all GPUs via --tensor-split
 }
 
 // NewConfigGenerator creates a new config generator
@@ -127,6 +139,9 @@ func (scg *ConfigGenerator) GenerateConfig(models []ModelInfo) error {
 		pm.UpdateProgress(processed, validModels, model.Name)
 		modelIDMap[model.Path] = scg.generateModelID(model)
 	}
+
+	// Assign models to GPUs (multi-GPU only; empty map preserves single-GPU behavior)
+	scg.gpuAssignments = scg.assignModelsToGPUs(models)
 
 	pm.UpdateStep("Writing model definitions...")
 	// Write models
@@ -268,13 +283,14 @@ func (scg *ConfigGenerator) writeModel(config *strings.Builder, model ModelInfo,
 		config.WriteString(fmt.Sprintf("      --ctx-size %d\n", optimalContext))
 		config.WriteString(fmt.Sprintf("      -ngl %d\n", nglValue))
 
-		// Add tensor-split for multi-GPU
-		if scg.SystemInfo != nil && len(scg.SystemInfo.VRAMDetails) > 1 {
-			gpuIndices := []string{}
-			for i := range scg.SystemInfo.VRAMDetails {
-				gpuIndices = append(gpuIndices, fmt.Sprintf("%d", i))
+		// Multi-GPU placement: oversized models span all GPUs via tensor-split;
+		// pinned models run on a single GPU (no tensor-split, env set below).
+		if a, ok := scg.gpuAssignments[model.Path]; ok && a.Oversized {
+			vramWeights := []string{}
+			for _, gpu := range scg.SystemInfo.VRAMDetails {
+				vramWeights = append(vramWeights, fmt.Sprintf("%.1f", gpu.VRAMGB))
 			}
-			config.WriteString(fmt.Sprintf("      --tensor-split %s\n", strings.Join(gpuIndices, ",")))
+			config.WriteString(fmt.Sprintf("      --tensor-split %s\n", strings.Join(vramWeights, ",")))
 		}
 
 		// Set KV cache type
@@ -291,10 +307,100 @@ func (scg *ConfigGenerator) writeModel(config *strings.Builder, model ModelInfo,
 	// Add TTL (Time To Live) - default 300 seconds
 	config.WriteString("    ttl: 300\n")
 
-	    // Add environment if needed (placeholder for future use)
-	    // config.WriteString("    env:\n")
-	    // config.WriteString("      - \"EXAMPLE_ENV=value\"\n")
-	    config.WriteString("\n")}
+	// Pin a model to its assigned GPU via CUDA_VISIBLE_DEVICES. CUDA_DEVICE_ORDER
+	// is forced to PCI_BUS_ID so device indices match the nvidia-smi ordering used
+	// during detection. Oversized (tensor-split) models see all GPUs, so no pinning.
+	if a, ok := scg.gpuAssignments[model.Path]; ok && !a.Oversized {
+		config.WriteString("    env:\n")
+		config.WriteString("      - \"CUDA_DEVICE_ORDER=PCI_BUS_ID\"\n")
+		config.WriteString(fmt.Sprintf("      - \"CUDA_VISIBLE_DEVICES=%d\"\n", a.DeviceID))
+	}
+
+	config.WriteString("\n")
+}
+
+// assignModelsToGPUs assigns each chat model to a single GPU by size (auto-balance),
+// marking models too large for any single GPU as oversized (handled via --tensor-split).
+// Embedding models are pinned to the smallest GPU. Returns an empty map for
+// single-GPU / CPU setups so legacy behavior is preserved untouched.
+func (scg *ConfigGenerator) assignModelsToGPUs(models []ModelInfo) map[string]gpuAssignment {
+	assignments := make(map[string]gpuAssignment)
+
+	// Only engage for multi-GPU, GPU-backed setups.
+	if scg.BinaryType == "cpu" || scg.SystemInfo == nil || len(scg.SystemInfo.VRAMDetails) < 2 {
+		return assignments
+	}
+
+	const reserveGB = 2.0 // headroom per card for context/overhead
+
+	// GPU slots sorted ascending by VRAM (smallest first => preferred on ties).
+	type gpuSlot struct {
+		deviceID int
+		vramGB   float64
+		count    int // models assigned so far, for balancing
+	}
+	gpus := make([]gpuSlot, 0, len(scg.SystemInfo.VRAMDetails))
+	for _, g := range scg.SystemInfo.VRAMDetails {
+		gpus = append(gpus, gpuSlot{deviceID: g.DeviceID, vramGB: g.VRAMGB})
+	}
+	sort.Slice(gpus, func(i, j int) bool { return gpus[i].vramGB < gpus[j].vramGB })
+	smallestDevice := gpus[0].deviceID
+	smallestVRAM := gpus[0].vramGB
+
+	// Chat models, sorted by size descending for deterministic, big-first placement.
+	type sizedModel struct {
+		model  ModelInfo
+		sizeGB float64
+	}
+	chatModels := make([]sizedModel, 0, len(models))
+	for _, m := range models {
+		if m.IsDraft || scg.isEmbeddingModel(m) {
+			continue
+		}
+		sizeGB := 20.0 // fallback when file info is unavailable
+		if info, err := GetModelFileInfo(m.Path); err == nil {
+			sizeGB = info.ActualSizeGB
+		}
+		chatModels = append(chatModels, sizedModel{model: m, sizeGB: sizeGB})
+	}
+	sort.Slice(chatModels, func(i, j int) bool { return chatModels[i].sizeGB > chatModels[j].sizeGB })
+
+	for _, sm := range chatModels {
+		// Pick the candidate GPU (model fits within vram-reserve) with the fewest
+		// models assigned so far; gpus is sorted smallest-first so ties favor the
+		// smaller card, keeping the larger card free for bigger models.
+		bestIdx := -1
+		for i := range gpus {
+			if sm.sizeGB <= gpus[i].vramGB-reserveGB {
+				if bestIdx == -1 || gpus[i].count < gpus[bestIdx].count {
+					bestIdx = i
+				}
+			}
+		}
+		if bestIdx == -1 {
+			assignments[sm.model.Path] = gpuAssignment{Oversized: true}
+			fmt.Printf("🎮 %s (%.1f GB) → oversized: tensor-split across all GPUs\n", sm.model.Name, sm.sizeGB)
+			continue
+		}
+		gpus[bestIdx].count++
+		assignments[sm.model.Path] = gpuAssignment{
+			DeviceID:  gpus[bestIdx].deviceID,
+			GPUVRAMGB: gpus[bestIdx].vramGB,
+		}
+		fmt.Printf("🎮 %s (%.1f GB) → GPU %d (%.1f GB)\n", sm.model.Name, sm.sizeGB, gpus[bestIdx].deviceID, gpus[bestIdx].vramGB)
+	}
+
+	// Pin embedding models to the smallest GPU (they coexist via a persistent group).
+	for _, m := range models {
+		if m.IsDraft || !scg.isEmbeddingModel(m) {
+			continue
+		}
+		assignments[m.Path] = gpuAssignment{DeviceID: smallestDevice, GPUVRAMGB: smallestVRAM}
+		fmt.Printf("🎮 %s (embedding) → GPU %d (%.1f GB)\n", m.Name, smallestDevice, smallestVRAM)
+	}
+
+	return assignments
+}
 
 // calculateOptimalNGL calculates the optimal number of GPU layers based on model size vs VRAM and system RAM
 func (scg *ConfigGenerator) calculateOptimalNGL(model ModelInfo) int {
@@ -320,7 +426,13 @@ func (scg *ConfigGenerator) calculateOptimalNGL(model ModelInfo) int {
 
 	// Reserve VRAM for context and other overhead (2GB)
 	reservedVRAM := 2.0
-	usableVRAM := scg.TotalVRAMGB - reservedVRAM
+	// Size against the assigned single GPU when this model is pinned (multi-GPU);
+	// oversized models and single-GPU setups use the total VRAM pool.
+	vramBudget := scg.TotalVRAMGB
+	if a, ok := scg.gpuAssignments[model.Path]; ok && !a.Oversized {
+		vramBudget = a.GPUVRAMGB
+	}
+	usableVRAM := vramBudget - reservedVRAM
 
 	// Get available system RAM (leave 25% buffer for system)
 	availableRAM := 0.0
@@ -330,7 +442,7 @@ func (scg *ConfigGenerator) calculateOptimalNGL(model ModelInfo) int {
 
 	fmt.Printf("🧮 Model: %s\n", model.Name)
 	fmt.Printf("   Size: %.2f GB, Layers: %d\n", modelSizeGB, totalLayers)
-	fmt.Printf("   VRAM: Total %.2f GB, Usable %.2f GB\n", scg.TotalVRAMGB, usableVRAM)
+	fmt.Printf("   VRAM: Budget %.2f GB, Usable %.2f GB\n", vramBudget, usableVRAM)
 	fmt.Printf("   RAM: Available %.2f GB\n", availableRAM)
 
 	// Check if entire model fits in VRAM
@@ -805,8 +917,16 @@ func (scg *ConfigGenerator) addParallelProcessing(config *strings.Builder, conte
 	}
 }
 
-// writeGroups writes model groups
+// writeGroups writes model groups. With multi-GPU assignments it emits one group
+// per GPU (so models on different cards run concurrently), a shared group for
+// oversized tensor-split models, and a persistent embeddings group. Without
+// assignments (single GPU / CPU) it falls back to the legacy large/small layout.
 func (scg *ConfigGenerator) writeGroups(config *strings.Builder, models []ModelInfo, modelIDMap map[string]string) {
+	if len(scg.gpuAssignments) > 0 {
+		scg.writeGroupsMultiGPU(config, models, modelIDMap)
+		return
+	}
+
 	largeModels := []string{}
 	smallModels := []string{}
 
@@ -851,6 +971,103 @@ func (scg *ConfigGenerator) writeGroups(config *strings.Builder, models []ModelI
 			config.WriteString(fmt.Sprintf("      - \"%s\"\n", model))
 		}
 	}
+}
+
+// writeGroupsMultiGPU emits per-GPU groups for the multi-GPU pinning layout.
+func (scg *ConfigGenerator) writeGroupsMultiGPU(config *strings.Builder, models []ModelInfo, modelIDMap map[string]string) {
+	perGPU := make(map[int][]string) // device ID -> chat model IDs
+	oversized := []string{}
+	embeddings := []string{}
+	embedDevice := 0
+
+	for _, model := range models {
+		if model.IsDraft {
+			continue
+		}
+		modelID := modelIDMap[model.Path]
+		a, ok := scg.gpuAssignments[model.Path]
+		if !ok {
+			continue
+		}
+		switch {
+		case scg.isEmbeddingModel(model):
+			embeddings = append(embeddings, modelID)
+			embedDevice = a.DeviceID
+		case a.Oversized:
+			oversized = append(oversized, modelID)
+		default:
+			perGPU[a.DeviceID] = append(perGPU[a.DeviceID], modelID)
+		}
+	}
+
+	// All GPU device IDs (sorted) for the oversized/shared group's occupancy.
+	allDevices := make([]int, 0, len(scg.SystemInfo.VRAMDetails))
+	for _, g := range scg.SystemInfo.VRAMDetails {
+		allDevices = append(allDevices, g.DeviceID)
+	}
+	sort.Ints(allDevices)
+
+	config.WriteString("\ngroups:\n")
+
+	// One group per GPU. exclusive:true triggers the occupancy check at runtime;
+	// since each group declares a single, non-overlapping GPU, they run concurrently.
+	devices := make([]int, 0, len(perGPU))
+	for dev := range perGPU {
+		devices = append(devices, dev)
+	}
+	sort.Ints(devices)
+	port := 8200
+	for _, dev := range devices {
+		config.WriteString(fmt.Sprintf("  \"gpu%d\":\n", dev))
+		config.WriteString("    swap: true\n")
+		config.WriteString("    exclusive: true\n")
+		config.WriteString(fmt.Sprintf("    gpus: [%d]\n", dev))
+		config.WriteString(fmt.Sprintf("    startPort: %d\n", port))
+		config.WriteString("    members:\n")
+		for _, m := range perGPU[dev] {
+			config.WriteString(fmt.Sprintf("      - \"%s\"\n", m))
+		}
+		config.WriteString("\n")
+		port += 100
+	}
+
+	// Shared group for oversized models that span all GPUs via tensor-split.
+	if len(oversized) > 0 {
+		config.WriteString("  \"large-shared\":\n")
+		config.WriteString("    swap: true\n")
+		config.WriteString("    exclusive: true\n")
+		config.WriteString(fmt.Sprintf("    gpus: [%s]\n", joinInts(allDevices, ", ")))
+		config.WriteString(fmt.Sprintf("    startPort: %d\n", port))
+		config.WriteString("    members:\n")
+		for _, m := range oversized {
+			config.WriteString(fmt.Sprintf("      - \"%s\"\n", m))
+		}
+		config.WriteString("\n")
+		port += 100
+	}
+
+	// Persistent embeddings group (always available, coexists with chat models).
+	if len(embeddings) > 0 {
+		config.WriteString("  \"embeddings\":\n")
+		config.WriteString("    swap: false\n")
+		config.WriteString("    exclusive: false\n")
+		config.WriteString("    persistent: true\n")
+		config.WriteString(fmt.Sprintf("    gpus: [%d]\n", embedDevice))
+		config.WriteString(fmt.Sprintf("    startPort: %d\n", port))
+		config.WriteString("    members:\n")
+		for _, m := range embeddings {
+			config.WriteString(fmt.Sprintf("      - \"%s\"\n", m))
+		}
+	}
+}
+
+// joinInts joins integers with a separator (e.g. "0, 1").
+func joinInts(nums []int, sep string) string {
+	parts := make([]string, len(nums))
+	for i, n := range nums {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, sep)
 }
 
 // findMatchingMMProj finds the matching mmproj file for a given model path

@@ -117,6 +117,7 @@ type GroupConfig struct {
 	Swap       bool     `yaml:"swap"`
 	Exclusive  bool     `yaml:"exclusive"`
 	Persistent bool     `yaml:"persistent"`
+	GPUs       []int    `yaml:"gpus"` // GPU device IDs this group occupies; empty = occupies all (legacy)
 	Members    []string `yaml:"members"`
 }
 
@@ -127,6 +128,7 @@ func (c *GroupConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Swap:       true,
 		Exclusive:  true,
 		Persistent: false,
+		GPUs:       []int{},
 		Members:    []string{},
 	}
 

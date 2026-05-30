@@ -6,6 +6,23 @@ import (
 	"path/filepath"
 )
 
+// findPrebuiltLlamaServer checks well-known locations for a pre-built llama-server binary
+// (e.g. Docker images that compile it at build time). Returns path and binaryType if found.
+func findPrebuiltLlamaServer() (string, string) {
+	exe, _ := os.Executable()
+	candidates := []string{
+		filepath.Join(filepath.Dir(exe), "llama-server"), // next to the running binary
+		"./llama-server",                                 // relative to working dir
+		"/app/llama-server",                              // common Docker install path
+	}
+	for _, path := range candidates {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, "prebuilt"
+		}
+	}
+	return "", ""
+}
+
 // SetupOptions contains configuration options for auto-setup
 type SetupOptions struct {
 	EnableDraftModels bool
@@ -170,17 +187,24 @@ func AutoSetupWithOptions(modelsFolder string, options SetupOptions) error {
 	mmprojMatches := FindMMProjMatches(models, modelsFolder)
 	fmt.Printf("\n")
 
-	// Download binary
-	fmt.Println("\n⬇️  Downloading llama-server binary...")
-
-	// Create binaries directory
-	binariesDir := filepath.Join(".", "binaries")
-	binary, err := DownloadBinary(binariesDir, system, options.ForceBackend)
-	if err != nil {
-		return fmt.Errorf("failed to download binary: %v", err)
+	// Locate llama-server binary — prefer a pre-built one (e.g. Docker image) over downloading
+	var binary *BinaryInfo
+	if prebuiltPath, _ := findPrebuiltLlamaServer(); prebuiltPath != "" {
+		fmt.Printf("✅ Using pre-built llama-server: %s\n", prebuiltPath)
+		binary = &BinaryInfo{Path: prebuiltPath, Type: options.ForceBackend}
+		if binary.Type == "" {
+			binary.Type = "cuda"
+		}
+	} else {
+		fmt.Println("\n⬇️  Downloading llama-server binary...")
+		binariesDir := filepath.Join(".", "binaries")
+		var dlErr error
+		binary, dlErr = DownloadBinary(binariesDir, system, options.ForceBackend)
+		if dlErr != nil {
+			return fmt.Errorf("failed to download binary: %v", dlErr)
+		}
+		fmt.Printf("✅ Downloaded: %s (%s)\n", binary.Path, binary.Type)
 	}
-
-	fmt.Printf("✅ Downloaded: %s (%s)\n", binary.Path, binary.Type)
 
 	// Generate configuration
 	fmt.Println("\n⚙️  Generating configuration...")
@@ -373,17 +397,24 @@ func AutoSetupMultiFoldersWithOptions(modelsFolders []string, options SetupOptio
 	// Print system information
 	PrintSystemInfo(&system)
 
-	// Download binary (same as single folder)
-	fmt.Println("\n⬇️  Downloading llama-server binary...")
-
-	// Create binaries directory
-	binariesDir := filepath.Join(".", "binaries")
-	binary, err := DownloadBinary(binariesDir, system, options.ForceBackend)
-	if err != nil {
-		return fmt.Errorf("failed to download binary: %v", err)
+	// Locate llama-server binary — prefer a pre-built one (e.g. Docker image) over downloading
+	var binary *BinaryInfo
+	if prebuiltPath, _ := findPrebuiltLlamaServer(); prebuiltPath != "" {
+		fmt.Printf("✅ Using pre-built llama-server: %s\n", prebuiltPath)
+		binary = &BinaryInfo{Path: prebuiltPath, Type: options.ForceBackend}
+		if binary.Type == "" {
+			binary.Type = "cuda"
+		}
+	} else {
+		fmt.Println("\n⬇️  Downloading llama-server binary...")
+		binariesDir := filepath.Join(".", "binaries")
+		var dlErr error
+		binary, dlErr = DownloadBinary(binariesDir, system, options.ForceBackend)
+		if dlErr != nil {
+			return fmt.Errorf("failed to download binary: %v", dlErr)
+		}
+		fmt.Printf("✅ Downloaded: %s (%s)\n", binary.Path, binary.Type)
 	}
-
-	fmt.Printf("✅ Downloaded: %s (%s)\n", binary.Path, binary.Type)
 
 	// Generate configuration
 	fmt.Println("\n⚙️  Generating configuration...")
@@ -432,8 +463,7 @@ func AutoSetupMultiFoldersWithOptions(modelsFolders []string, options SetupOptio
 	generator.SetMMProjMatches(allMMProjMatches) // Pass all mmproj matches to config generator
 
 	fmt.Printf("⚙️  Generating configuration from %d folders (SMART GPU ALLOCATION: fit max layers in VRAM)...\n", len(validFolders))
-	err = generator.GenerateConfig(allModels) // Use ALL models from ALL folders
-	if err != nil {
+	if err := generator.GenerateConfig(allModels); err != nil {
 		return fmt.Errorf("failed to generate configuration: %v", err)
 	}
 

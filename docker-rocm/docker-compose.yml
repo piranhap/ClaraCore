@@ -8,15 +8,22 @@ services:
     container_name: claracore-rocm
     image: claracore:rocm
     restart: unless-stopped
+    # ClaraCore writes its state (config.yaml, model_folders.json, settings.json,
+    # progress_state.json) relative to the working directory, so run it from the
+    # persistent /data volume below.
+    working_dir: /data
     ports:
       - "5890:5890"
     volumes:
-      # Persistent volume for downloaded models
-      - claracore-rocm-downloads:/app/downloads
+      # Persistent state: config.yaml, model_folders.json, settings.json, etc.
+      - claracore-rocm-data:/data
+
+      # Persistent volume for downloaded models (kept under the working dir)
+      - claracore-rocm-downloads:/data/downloads
       
       # Optional: Bind mount your own model folders
       # Uncomment and customize the paths below to use your existing models
-      # - /path/to/your/models:/app/models:ro          # Read-only access
+      - /mnt/models/ggufs:/app/models:ro          # Read-only access
       # - /mnt/storage/llm-models:/app/external:ro     # Another folder
       # - ~/ai-models:/app/my-models:ro                # Home directory models
       
@@ -36,6 +43,11 @@ services:
       - render
 
 volumes:
+  # Persistent ClaraCore state (config, folder DB, settings). Survives 'down'.
+  # To reset configuration: docker-compose down -v (also deletes downloads!)
+  claracore-rocm-data:
+    name: claracore-rocm-data
+
   # Persistent storage for downloaded models only
   # This volume persists even after 'docker-compose down'
   # To delete: docker-compose down -v (WARNING: deletes all downloaded models!)

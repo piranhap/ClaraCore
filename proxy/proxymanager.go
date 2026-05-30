@@ -529,7 +529,21 @@ func (pm *ProxyManager) swapProcessGroup(requestedModel string) (*ProcessGroup, 
 		return nil, realModelName, fmt.Errorf("could not find process group for model %s", requestedModel)
 	}
 
-	if processGroup.exclusive {
+	if len(processGroup.gpus) > 0 {
+		// GPU-occupancy-aware: only stop non-persistent groups whose GPU set overlaps.
+		// This lets per-GPU groups (e.g. gpus:[0] and gpus:[1]) run concurrently while
+		// a both-GPU group (gpus:[0,1]) still evicts them on activation.
+		pm.proxyLogger.Debugf("GPU-aware mode for group %s (gpus=%v), stopping overlapping process groups", processGroup.id, processGroup.gpus)
+		for groupId, otherGroup := range pm.processGroups {
+			if groupId == processGroup.id || otherGroup.persistent {
+				continue
+			}
+			// Empty GPU set on the other group means it occupies all GPUs (legacy) -> always conflicts.
+			if len(otherGroup.gpus) == 0 || gpusIntersect(processGroup.gpus, otherGroup.gpus) {
+				otherGroup.StopProcesses(StopWaitForInflightRequest)
+			}
+		}
+	} else if processGroup.exclusive {
 		pm.proxyLogger.Debugf("Exclusive mode for group %s, stopping other process groups", processGroup.id)
 		for groupId, otherGroup := range pm.processGroups {
 			if groupId != processGroup.id && !otherGroup.persistent {
@@ -539,6 +553,18 @@ func (pm *ProxyManager) swapProcessGroup(requestedModel string) (*ProcessGroup, 
 	}
 
 	return processGroup, realModelName, nil
+}
+
+// gpusIntersect reports whether two GPU device-ID sets share any device.
+func gpusIntersect(a, b []int) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (pm *ProxyManager) listModelsHandler(c *gin.Context) {

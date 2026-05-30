@@ -8,11 +8,18 @@ services:
     container_name: claracore
     image: claracore:cuda
     restart: unless-stopped
+    # ClaraCore writes its state (config.yaml, model_folders.json, settings.json,
+    # progress_state.json) relative to the working directory, so run it from the
+    # persistent /data volume below.
+    working_dir: /data
     ports:
       - "5890:5890"
     volumes:
-      # Persistent volume for downloaded models
-      - claracore-downloads:/app/downloads
+      # Persistent state: config.yaml, model_folders.json, settings.json, etc.
+      - claracore-data:/data
+
+      # Persistent volume for downloaded models (kept under the working dir)
+      - claracore-downloads:/data/downloads
       
       # Optional: Bind mount your own model folders
       # Uncomment and customize the paths below to use your existing models
@@ -32,6 +39,11 @@ services:
               capabilities: [gpu]
 
 volumes:
+  # Persistent ClaraCore state (config, folder DB, settings). Survives 'down'.
+  # To reset configuration: docker-compose down -v (also deletes downloads!)
+  claracore-data:
+    name: claracore-data
+
   # Persistent storage for downloaded models only
   # This volume persists even after 'docker-compose down'
   # To delete: docker-compose down -v (WARNING: deletes all downloaded models!)

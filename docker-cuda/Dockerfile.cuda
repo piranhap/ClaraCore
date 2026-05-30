@@ -18,11 +18,26 @@ FROM ubuntu:24.04
 # Set working directory
 WORKDIR /app
 
-# Copy llama-server from the builder stage
+# Copy llama-server and all its shared libraries from the builder stage.
+# The fork builds llama-server thin-linked against libggml*/libllama*/libmtmd .so,
+# so the binary alone fails with "libllama-server-impl.so: cannot open shared object file".
 COPY --from=builder /llama.cpp/build/bin/llama-server /app/llama-server
+COPY --from=builder /llama.cpp/build/bin/*.so* /app/
+
+# CUDA runtime libraries (from the toolkit in the builder stage). libcuda.so.1
+# (the driver) is injected by the NVIDIA container runtime, so it is NOT copied here.
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcudart.so.12* /app/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcublas.so.12* /app/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcublasLt.so.12* /app/
+
+# OpenMP runtime (not present in the minimal ubuntu base image)
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1* /app/
 
 # Copy the ClaraCore binary from the build context
 COPY claracore /app/claracore
+
+# Resolve the bundled shared libraries at runtime
+ENV LD_LIBRARY_PATH=/app
 
 # Make binaries executable
 RUN chmod +x /app/claracore /app/llama-server
