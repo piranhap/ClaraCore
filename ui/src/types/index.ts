@@ -31,6 +31,13 @@ export interface SystemDetection {
     vramGB: number;
     computeCapability?: string;
   } | null;
+  allGPUs?: Array<{
+    name: string;
+    brand: string;
+    vramGB: number;
+    index: number;
+  }>;
+  gpuCount?: number;
   totalRAMGB: number;
   availableRAMGB: number;
   recommendedBackends: string[];

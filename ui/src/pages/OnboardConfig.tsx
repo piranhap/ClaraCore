@@ -160,30 +160,46 @@ const OnboardConfig: React.FC = () => {
           else if (detection.primaryGPU.brand === 'apple') gpuType = 'apple';
           else if (detection.primaryGPU.brand === 'intel') gpuType = 'intel';
 
+          // Use total VRAM across all GPUs (sum from allGPUs if available, else fall back to primaryGPU)
+          const totalVRAM = detection.allGPUs && detection.allGPUs.length > 1
+            ? detection.allGPUs.reduce((sum: number, gpu: { vramGB: number }) => sum + gpu.vramGB, 0)
+            : (detection.primaryGPU.vramGB || 0);
+
           setSystemConfig(prev => ({
             ...prev,
             hasGPU: detection.gpuDetected || false,
             gpuType: gpuType,
-            vramGB: Math.floor(detection.primaryGPU.vramGB || 0),
+            vramGB: Math.floor(totalVRAM),
             backend: detection.recommendations?.primaryBackend || 'cuda',
           }));
+
+          // Build notification message
+          const gpuCount = detection.gpuCount ?? 1;
+          let hardwareMsg: string;
+          if (gpuCount > 1 && detection.allGPUs && detection.allGPUs.length > 1) {
+            const gpuNames = detection.allGPUs.map((g: { name: string }) => g.name).join(' + ');
+            hardwareMsg = `${gpuCount} GPUs detected: ${gpuNames} (${Math.floor(totalVRAM)}GB total VRAM)`;
+          } else {
+            hardwareMsg = detection.primaryGPU.name;
+          }
+          setAutoDetected(true);
+          showNotification('success', `Hardware detected: ${hardwareMsg}`);
         } else {
           setSystemConfig(prev => ({
             ...prev,
             hasGPU: false,
             backend: 'cpu',
           }));
+          setAutoDetected(true);
+          showNotification('success', 'Hardware detected: CPU-only configuration');
         }
-        
+
         setSystemConfig(prev => ({
           ...prev,
           ramGB: Math.floor(detection.totalRAMGB || 0),
           preferredContext: detection.recommendations?.suggestedContextSize || 32768,
           throughputFirst: detection.recommendations?.throughputFirst || true,
         }));
-        
-        setAutoDetected(true);
-        showNotification('success', `Hardware detected: ${detection.primaryGPU ? detection.primaryGPU.name : 'CPU-only configuration'}`);
       } else {
         showNotification('error', 'Failed to detect system. Please fill in manually.');
       }
@@ -761,10 +777,25 @@ const OnboardConfig: React.FC = () => {
                     <CheckCircleIcon className="w-6 h-6 text-white" />
                   </div>
                   <div>
-                    <h3 className="font-semibold text-text-primary">Hardware Detected</h3>
-                    <p className="text-sm text-text-secondary">
-                      {systemDetection.primaryGPU ? systemDetection.primaryGPU.name : 'CPU-only system'}
-                    </p>
+                    <h3 className="font-semibold text-text-primary">
+                      Hardware Detected
+                      {systemDetection.gpuCount && systemDetection.gpuCount > 1 && (
+                        <span className="ml-2 text-xs font-medium px-2 py-0.5 bg-brand-500 text-white rounded-full">
+                          {systemDetection.gpuCount} GPUs
+                        </span>
+                      )}
+                    </h3>
+                    {systemDetection.allGPUs && systemDetection.allGPUs.length > 1 ? (
+                      <ul className="text-sm text-text-secondary space-y-0.5">
+                        {systemDetection.allGPUs.map((gpu, i) => (
+                          <li key={i}>GPU {gpu.index}: {gpu.name} ({gpu.vramGB}GB)</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-sm text-text-secondary">
+                        {systemDetection.primaryGPU ? systemDetection.primaryGPU.name : 'CPU-only system'}
+                      </p>
+                    )}
                   </div>
                 </>
               ) : (
