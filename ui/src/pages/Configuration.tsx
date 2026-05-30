@@ -16,7 +16,9 @@ import {
   MemoryStickIcon,
   DownloadIcon,
   ServerIcon,
-  InfoIcon
+  InfoIcon,
+  Trash2Icon,
+  PlusIcon
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -55,6 +57,19 @@ interface BinaryStatus {
   error?: string;
 }
 
+interface DetectedGPU {
+  index: number;
+  name: string;
+  vramGB: number;
+  brand?: string;
+}
+
+// A single editable pin row: a case-insensitive filename substring -> GPU device id.
+interface GPUPinRow {
+  key: string;
+  dev: number;
+}
+
 const Configuration: React.FC = () => {
   const navigate = useNavigate();
   const [models, setModels] = useState<ConfiguredModel[]>([]);
@@ -72,11 +87,17 @@ const Configuration: React.FC = () => {
   const [apiKey, setApiKey] = useState<string>("");
   const [binaryStatus, setBinaryStatus] = useState<BinaryStatus | null>(null);
   const [isUpdatingBinary, setIsUpdatingBinary] = useState(false);
+  const [gpus, setGpus] = useState<DetectedGPU[]>([]);
+  const [pinRows, setPinRows] = useState<GPUPinRow[]>([]);
+  const [pinsDirty, setPinsDirty] = useState(false);
+  const [isApplyingPins, setIsApplyingPins] = useState(false);
 
   useEffect(() => {
     loadConfiguration();
     loadSystemSettings();
     loadBinaryStatus();
+    loadGPUInfo();
+    loadGPUPins();
   }, []);
 
   const showNotification = (type: 'success' | 'error' | 'info', message: string) => {
@@ -173,6 +194,119 @@ const Configuration: React.FC = () => {
       }
     } catch (e: any) {
       showNotification('error', `Failed to save settings: ${e?.message || e}`);
+    }
+  };
+
+  // --- Manual GPU pinning ---------------------------------------------------
+  // Pins force a model onto a specific GPU, overriding the auto-balancer. They
+  // are keyed by a case-insensitive substring of the model filename (matched in
+  // autosetup/config_generator.go) and only matter on multi-GPU systems.
+  const loadGPUInfo = async () => {
+    try {
+      const res = await fetch('/api/system/detection');
+      if (res.ok) {
+        const data = await res.json();
+        const all = Array.isArray(data.allGPUs) ? data.allGPUs : [];
+        setGpus(all.map((g: any) => ({
+          index: g.index ?? 0,
+          name: g.name || `GPU ${g.index ?? 0}`,
+          vramGB: g.vramGB || 0,
+          brand: g.brand,
+        })));
+      }
+    } catch (e) { /* detection is best-effort */ }
+  };
+
+  const loadGPUPins = async () => {
+    try {
+      const res = await fetch('/api/config/gpu-pins');
+      if (res.ok) {
+        const data = await res.json();
+        const pins = (data && data.gpuPins) || {};
+        setPinRows(Object.entries(pins).map(([key, dev]) => ({ key, dev: Number(dev) || 0 })));
+        setPinsDirty(false);
+      }
+    } catch (e) { /* no pins yet */ }
+  };
+
+  // Derive a sensible default pin substring from a configured model's filename:
+  // strip directory, the .gguf extension and any "-00001-of-00003" shard suffix.
+  const pinKeyForModel = (model: ConfiguredModel): string => {
+    const path = model.filePath || '';
+    const base = path.split(/[\\/]/).pop() || model.id;
+    return base
+      .replace(/\.gguf$/i, '')
+      .replace(/-\d{5}-of-\d{5}$/i, '')
+      .trim();
+  };
+
+  const addPinRow = () => {
+    setPinRows(prev => [...prev, { key: '', dev: gpus[0]?.index ?? 0 }]);
+    setPinsDirty(true);
+  };
+
+  const addPinFromModel = (model: ConfiguredModel) => {
+    const key = pinKeyForModel(model);
+    setPinRows(prev => {
+      if (prev.some(r => r.key.toLowerCase() === key.toLowerCase())) return prev;
+      return [...prev, { key, dev: gpus[0]?.index ?? 0 }];
+    });
+    setPinsDirty(true);
+  };
+
+  const updatePinRow = (idx: number, patch: Partial<GPUPinRow>) => {
+    setPinRows(prev => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+    setPinsDirty(true);
+  };
+
+  const removePinRow = (idx: number) => {
+    setPinRows(prev => prev.filter((_, i) => i !== idx));
+    setPinsDirty(true);
+  };
+
+  // Persist pins (and optionally regenerate config.yaml so they take effect).
+  const saveGPUPins = async (apply: boolean) => {
+    // Collapse rows into the map the API expects; drop blank keys, last-wins on dupes.
+    const map: Record<string, number> = {};
+    for (const r of pinRows) {
+      const k = r.key.trim();
+      if (k) map[k] = r.dev;
+    }
+    setIsApplyingPins(true);
+    try {
+      const res = await fetch('/api/config/gpu-pins', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpuPins: map }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        showNotification('error', `Failed to save GPU pins: ${txt}`);
+        return;
+      }
+      setPinsDirty(false);
+      if (!apply) {
+        showNotification('success', 'GPU pins saved. They apply on the next config regeneration.');
+        return;
+      }
+      // Regenerate config from the model database; saved pins are merged in by
+      // the backend and the server soft-restarts to pick up the new config.
+      const regen = await fetch('/api/config/regenerate-from-db', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (regen.ok) {
+        showNotification('success', 'GPU pins saved and config regenerated. Server is reloading...');
+        setTimeout(() => loadConfiguration(), 1500);
+      } else {
+        const txt = await regen.text();
+        showNotification('error', `Pins saved, but config regeneration failed: ${txt}`);
+      }
+    } catch (e: any) {
+      showNotification('error', `Failed to save GPU pins: ${e?.message || e}`);
+    } finally {
+      setIsApplyingPins(false);
     }
   };
 
@@ -787,6 +921,119 @@ const Configuration: React.FC = () => {
             )}
           </CardContent>
         </Card>
+
+        {/* Manual GPU pinning (multi-GPU systems only) */}
+        {gpus.length >= 2 && (
+          <Card className="lg:col-span-3">
+            <CardHeader>
+              <div className="flex items-center space-x-2">
+                <CpuIcon className="w-5 h-5 text-brand-500" />
+                <CardTitle>GPU Pinning</CardTitle>
+              </div>
+              <CardDescription>
+                Force specific models onto a chosen GPU, overriding auto-balancing. A pin matches any
+                model whose filename contains the text (case-insensitive). Applies on config regeneration.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {/* GPU legend */}
+              <div className="flex flex-wrap gap-2 mb-4">
+                {gpus.map((g) => (
+                  <div key={g.index} className="flex items-center space-x-2 px-3 py-1.5 rounded-lg bg-surface-secondary border border-border-secondary">
+                    <CpuIcon className="w-4 h-4 text-brand-500" />
+                    <span className="text-sm font-medium text-text-primary">GPU {g.index}</span>
+                    <span className="text-xs text-text-secondary truncate max-w-[200px]">{g.name}</span>
+                    {g.vramGB > 0 && (
+                      <span className="text-xs text-text-tertiary">{g.vramGB.toFixed(0)} GB</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Pin rows */}
+              {pinRows.length === 0 ? (
+                <p className="text-sm text-text-secondary mb-4">
+                  No pins set. Unpinned models are auto-balanced across GPUs.
+                </p>
+              ) : (
+                <div className="space-y-2 mb-4">
+                  {pinRows.map((row, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={row.key}
+                        placeholder="filename substring (e.g. hermes)"
+                        onChange={(e) => updatePinRow(idx, { key: e.target.value })}
+                        className="flex-1 p-2 rounded border border-border-secondary bg-background text-text-primary text-sm font-mono"
+                      />
+                      <span className="text-text-tertiary text-sm">→</span>
+                      <select
+                        value={row.dev}
+                        onChange={(e) => updatePinRow(idx, { dev: Number(e.target.value) })}
+                        className="p-2 rounded border border-border-secondary bg-background text-text-primary text-sm"
+                      >
+                        {gpus.map((g) => (
+                          <option key={g.index} value={g.index}>GPU {g.index}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => removePinRow(idx)}
+                        className="p-2 rounded text-text-tertiary hover:text-error-500 hover:bg-error-50 dark:hover:bg-error-900/20"
+                        title="Remove pin"
+                      >
+                        <Trash2Icon className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Add controls */}
+              <div className="flex flex-wrap items-center gap-2 mb-4">
+                <Button variant="outline" onClick={addPinRow} icon={<PlusIcon className="w-4 h-4" />}>
+                  Add Pin
+                </Button>
+                {models.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const m = models.find((mm) => mm.id === e.target.value);
+                      if (m) addPinFromModel(m);
+                    }}
+                    className="p-2 rounded border border-border-secondary bg-background text-text-secondary text-sm"
+                  >
+                    <option value="">Add from model…</option>
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              {/* Save actions */}
+              <div className="flex items-center gap-2">
+                <Button
+                  onClick={() => saveGPUPins(false)}
+                  disabled={!pinsDirty || isApplyingPins}
+                  variant="outline"
+                  icon={<SaveIcon className="w-4 h-4" />}
+                >
+                  Save Pins
+                </Button>
+                <Button
+                  onClick={() => saveGPUPins(true)}
+                  loading={isApplyingPins}
+                  icon={<RefreshCwIcon className="w-4 h-4" />}
+                >
+                  Save &amp; Apply
+                </Button>
+                <span className="text-xs text-text-tertiary ml-1">
+                  “Apply” regenerates config.yaml and reloads the server.
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Security / API key settings */}
         <Card className="lg:col-span-3">
