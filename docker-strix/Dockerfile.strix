@@ -1,30 +1,52 @@
-# Stage 1: Build llama-server with Vulkan support from the forked repository
-FROM ubuntu:22.04 as builder
+# Stage 1: Build llama-server with Vulkan support from the forked repository.
+#
+# Strix Halo's iGPU is driven through Vulkan (Mesa RADV) rather than ROCm, so
+# we build the Vulkan backend. The build needs the Vulkan headers/loader and
+# the glslc shader compiler; the runtime needs the loader + Mesa driver.
+FROM ubuntu:24.04 AS builder
 
-# Install build dependencies
-# Note: Installing the Vulkan SDK can be complex.
-# This assumes a base set of packages. You may need to adjust.
-RUN apt-get update && apt-get install -y git build-essential cmake
+# Build dependencies, including the Vulkan SDK pieces llama.cpp needs:
+# libvulkan-dev (headers/loader), glslc + glslang-tools (shader compilers) and
+# spirv-headers/spirv-tools (the ggml-vulkan backend's find_package requires them).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates build-essential cmake \
+    libvulkan-dev glslc glslang-tools spirv-headers spirv-tools \
+    && rm -rf /var/lib/apt/lists/*
 
 # Clone the forked llama.cpp repository
 RUN git clone https://github.com/piranhap/llama.cpp.git
 
-# Build llama-server using cmake with Vulkan enabled
+# Build llama-server with Vulkan enabled
 WORKDIR /llama.cpp
-RUN cmake -B build -DGGML_VULKAN=ON
-RUN cmake --build build --config Release
+RUN cmake -B build \
+      -DGGML_VULKAN=ON \
+      -DCMAKE_BUILD_TYPE=Release
+RUN cmake --build build --config Release -j"$(nproc)"
 
 # Stage 2: Create the final ClaraCore image
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Set working directory
 WORKDIR /app
 
-# Copy llama-server from the builder stage
+# Runtime dependencies: OpenMP (used by ggml), the Vulkan loader, and the Mesa
+# Vulkan driver (RADV) that backs the Strix Halo iGPU. The actual GPU device
+# nodes (/dev/dri) are provided by the host via docker-compose.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 libvulkan1 mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy llama-server and all its shared libraries from the builder stage.
+# The fork builds llama-server thin-linked against libggml*/libllama*/libmtmd .so,
+# so the binary alone fails with "libllama-server-impl.so: cannot open shared object file".
 COPY --from=builder /llama.cpp/build/bin/llama-server /app/llama-server
+COPY --from=builder /llama.cpp/build/bin/*.so* /app/
 
 # Copy the ClaraCore binary from the build context
 COPY claracore /app/claracore
+
+# Resolve the bundled shared libraries at runtime
+ENV LD_LIBRARY_PATH=/app
 
 # Make binaries executable
 RUN chmod +x /app/claracore /app/llama-server
